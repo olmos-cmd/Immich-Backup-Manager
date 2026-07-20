@@ -1,0 +1,2692 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use eframe::egui;
+use reqwest::blocking::Client;
+use reqwest::header::{CONTENT_RANGE, RANGE};
+use chrono::{Datelike, Local};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Deserialize)]
+struct Album {
+    id: String,
+    #[serde(rename = "albumName")]
+    album_name: String,
+    #[serde(rename = "assetCount", default)]
+    asset_count: usize,
+    #[serde(default)]
+    shared: bool,
+    #[serde(rename = "albumThumbnailAssetId", default)]
+    album_thumbnail_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Asset {
+    id: String,
+    #[serde(rename = "originalFileName", default)]
+    original_file_name: String,
+    #[serde(rename = "deviceAssetId", default)]
+    device_asset_id: String,
+    #[serde(rename = "type", default)]
+    asset_type: String,
+    #[serde(default)]
+    checksum: String,
+    #[serde(rename = "localDateTime", default)]
+    local_date_time: String,
+    #[serde(rename = "fileSizeInByte", default)]
+    file_size_in_byte: i64,
+}
+
+#[derive(Clone)]
+struct SelectableAlbum {
+    album: Album,
+    selected: bool,
+    thumbnail: Option<egui::TextureHandle>,
+}
+
+#[derive(Clone)]
+struct YearBucket {
+    year: String,
+    count: usize,
+    total_size: i64,
+    selected: bool,
+}
+
+#[derive(Clone)]
+struct DownloadJob {
+    asset: Asset,
+    folder_name: String,
+    group_name: String,
+    album_position: Option<(usize, usize)>,
+}
+
+#[derive(Clone)]
+struct ConflictItem {
+    job: DownloadJob,
+    selected: bool,
+    local_size: u64,
+    remote_size: Option<u64>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum MediaMode {
+    All,
+    Photos,
+    Videos,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ExistingMode {
+    Ask,
+    Overwrite,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ActiveTab {
+    Albums,
+    NoAlbum,
+    AllByYear,
+}
+
+enum ThumbnailEvent {
+    Loaded { album_id: String, bytes: Vec<u8> },
+    Failed { album_id: String },
+}
+
+enum DownloadEvent {
+    Preparing(String),
+    AlbumProgress {
+        current: usize,
+        total: usize,
+        album_name: String,
+    },
+    Prepared(usize),
+    Progress {
+        current: usize,
+        total: usize,
+        file_name: String,
+        downloaded: usize,
+        skipped: usize,
+        failed: usize,
+        active: usize,
+    },
+    Finished {
+        downloaded: usize,
+        skipped: usize,
+        failed: usize,
+        conflicts: Vec<ConflictItem>,
+        cancelled: bool,
+    },
+    Error(String),
+}
+
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SavedSettings {
+    server: String,
+    api_key: String,
+}
+
+fn settings_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(appdata)
+            .join("Immich_Backup_Manager")
+            .join("settings.json"),
+    )
+}
+
+fn load_saved_settings() -> SavedSettings {
+    let Some(path) = settings_path() else {
+        return SavedSettings::default();
+    };
+
+    let Ok(data) = fs::read_to_string(path) else {
+        return SavedSettings::default();
+    };
+
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+fn save_settings(server: &str, api_key: &str) -> Result<(), String> {
+    let path = settings_path().ok_or_else(|| "APPDATA-Ordner wurde nicht gefunden.".to_string())?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let settings = SavedSettings {
+        server: server.to_string(),
+        api_key: api_key.to_string(),
+    };
+
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
+}
+
+fn delete_saved_settings() -> Result<(), String> {
+    let Some(path) = settings_path() else {
+        return Ok(());
+    };
+
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+struct ImmichApp {
+    server: String,
+    api_key: String,
+    show_key: bool,
+    own_albums: bool,
+    shared_albums: bool,
+    deduplicate: bool,
+    album_search: String,
+    year_search: String,
+    albums: Vec<SelectableAlbum>,
+    thumbnail_receiver: Option<Receiver<ThumbnailEvent>>,
+    logo_texture: Option<egui::TextureHandle>,
+    no_album_assets: Vec<Asset>,
+    year_buckets: Vec<YearBucket>,
+
+    all_assets: Vec<Asset>,
+    all_year_buckets: Vec<YearBucket>,
+
+    media_mode: MediaMode,
+    existing_mode: ExistingMode,
+    active_tab: ActiveTab,
+    target_dir: String,
+    status: String,
+    progress: f32,
+
+    parallel_downloads: usize,
+    download_receiver: Option<Receiver<DownloadEvent>>,
+    download_cancel: Option<Arc<AtomicBool>>,
+    download_running: bool,
+    download_popup: bool,
+    download_current: usize,
+    download_total: usize,
+    download_file: String,
+    download_downloaded: usize,
+    download_skipped: usize,
+    download_failed: usize,
+    download_active: usize,
+    download_album_current: usize,
+    download_album_total: usize,
+    download_album_name: String,
+
+    conflict_popup: bool,
+    conflicts: Vec<ConflictItem>,
+    conflict_index: usize,
+    conflict_preview_key: String,
+    conflict_local_texture: Option<egui::TextureHandle>,
+    conflict_remote_texture: Option<egui::TextureHandle>,
+    conflict_local_dims: Option<(u32, u32)>,
+    conflict_remote_dims: Option<(u32, u32)>,
+    conflict_zoom_open: bool,
+    conflict_zoom_title: String,
+    conflict_zoom_texture: Option<egui::TextureHandle>,
+    info_popup: bool,
+}
+
+impl Default for ImmichApp {
+    fn default() -> Self {
+        let saved = load_saved_settings();
+        let server = if saved.server.trim().is_empty() {
+            "http://192.168.30.12:2283".to_owned()
+        } else {
+            saved.server
+        };
+
+        Self {
+            server,
+            api_key: saved.api_key,
+            show_key: false,
+            own_albums: true,
+            shared_albums: true,
+            deduplicate: true,
+            album_search: String::new(),
+            year_search: String::new(),
+            albums: Vec::new(),
+            thumbnail_receiver: None,
+            logo_texture: None,
+            no_album_assets: Vec::new(),
+            year_buckets: Vec::new(),
+
+            all_assets: Vec::new(),
+            all_year_buckets: Vec::new(),
+
+            media_mode: MediaMode::All,
+            existing_mode: ExistingMode::Ask,
+            active_tab: ActiveTab::Albums,
+            target_dir: String::new(),
+            status: "Bereit.".to_owned(),
+            progress: 0.0,
+            parallel_downloads: 6,
+            download_receiver: None,
+            download_cancel: None,
+            download_running: false,
+            download_popup: false,
+            download_current: 0,
+            download_total: 0,
+            download_file: String::new(),
+            download_downloaded: 0,
+            download_skipped: 0,
+            download_failed: 0,
+            download_active: 0,
+            download_album_current: 0,
+            download_album_total: 0,
+            download_album_name: String::new(),
+            conflict_popup: false,
+            conflicts: Vec::new(),
+            conflict_index: 0,
+            conflict_preview_key: String::new(),
+            conflict_local_texture: None,
+            conflict_remote_texture: None,
+            conflict_local_dims: None,
+            conflict_remote_dims: None,
+            conflict_zoom_open: false,
+            conflict_zoom_title: String::new(),
+            conflict_zoom_texture: None,
+            info_popup: false,
+        }
+    }
+}
+
+impl ImmichApp {
+    fn client(&self) -> Result<Client, String> {
+        Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    fn base_url(&self) -> Result<String, String> {
+        let s = self.server.trim().trim_end_matches('/').to_string();
+        if s.is_empty() {
+            return Err("Bitte Immich-Serveradresse eingeben.".to_string());
+        }
+        if s.starts_with("http://") || s.starts_with("https://") {
+            Ok(s)
+        } else {
+            Ok(format!("http://{}", s))
+        }
+    }
+
+    fn ensure_api_key(&self) -> Result<&str, String> {
+        let key = self.api_key.trim();
+        if key.is_empty() {
+            Err("Bitte API-Key eingeben.".to_string())
+        } else {
+            Ok(key)
+        }
+    }
+
+    fn apply_style(ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.visuals = egui::Visuals::light();
+        style.visuals.window_fill = egui::Color32::from_rgb(248, 249, 251);
+        style.visuals.panel_fill = egui::Color32::from_rgb(248, 249, 251);
+        style.visuals.extreme_bg_color = egui::Color32::WHITE;
+        style.visuals.faint_bg_color = egui::Color32::from_rgb(242, 244, 247);
+        style.visuals.selection.bg_fill = egui::Color32::from_rgb(25, 105, 235);
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(246, 247, 249);
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(218, 222, 228));
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(235, 242, 253);
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(25, 105, 235));
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(220, 233, 252);
+        style.visuals.override_text_color = Some(egui::Color32::from_rgb(31, 36, 44));
+        style.text_styles = [
+            (egui::TextStyle::Heading, egui::FontId::new(22.0, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Body, egui::FontId::new(14.0, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Button, egui::FontId::new(14.0, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Monospace, egui::FontId::new(12.5, egui::FontFamily::Monospace)),
+        ].into();
+        ctx.set_style(style);
+    }
+
+    fn media_matches(asset: &Asset, mode: MediaMode) -> bool {
+        match mode {
+            MediaMode::All => true,
+            MediaMode::Photos => asset.asset_type == "IMAGE",
+            MediaMode::Videos => asset.asset_type == "VIDEO",
+        }
+    }
+
+    fn load_albums(&mut self) -> Result<(), String> {
+        let base = self.base_url()?;
+        let key = self.ensure_api_key()?.to_string();
+        let client = self.client()?;
+        self.status = "Verbinde mit Immich ...".to_owned();
+
+        let resp = client
+            .get(format!("{}/api/albums", base))
+            .header("x-api-key", &key)
+            .send()
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+
+        let albums: Vec<Album> = resp.json().map_err(|e| e.to_string())?;
+        let mut items: Vec<SelectableAlbum> = albums
+            .into_iter()
+            .filter(|a| (a.shared && self.shared_albums) || (!a.shared && self.own_albums))
+            .map(|album| SelectableAlbum { album, selected: false, thumbnail: None })
+            .collect();
+
+        items.sort_by(|a, b| a.album.album_name.to_lowercase().cmp(&b.album.album_name.to_lowercase()));
+        let count = items.len();
+        self.albums = items;
+        self.status = format!("Verbindung erfolgreich. {} Album/Alben geladen.", count);
+        self.start_thumbnail_loading(&base, &key, &client);
+        Ok(())
+    }
+
+    fn start_thumbnail_loading(&mut self, base: &str, api_key: &str, client: &Client) {
+        let jobs: Vec<(String, Option<String>)> = self
+            .albums
+            .iter()
+            .map(|item| {
+                (
+                    item.album.id.clone(),
+                    item.album.album_thumbnail_asset_id.clone(),
+                )
+            })
+            .collect();
+
+        if jobs.is_empty() {
+            self.thumbnail_receiver = None;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel::<ThumbnailEvent>();
+        self.thumbnail_receiver = Some(rx);
+        let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+        let worker_count = 8usize.min(queue.lock().map(|q| q.len()).unwrap_or(1)).max(1);
+
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let tx = tx.clone();
+            let client = client.clone();
+            let base = base.to_string();
+            let api_key = api_key.to_string();
+
+            thread::spawn(move || loop {
+                let job = queue.lock().ok().and_then(|mut q| q.pop_front());
+                let Some((album_id, known_thumbnail_id)) = job else { break; };
+
+                let thumbnail_id = if let Some(id) = known_thumbnail_id.filter(|id| !id.trim().is_empty()) {
+                    Some(id)
+                } else {
+                    client
+                        .get(format!("{}/api/albums/{}", base, album_id))
+                        .header("x-api-key", &api_key)
+                        .send()
+                        .and_then(|r| r.error_for_status())
+                        .ok()
+                        .and_then(|r| r.json::<serde_json::Value>().ok())
+                        .and_then(|value| {
+                            value
+                                .get("albumThumbnailAssetId")
+                                .and_then(|x| x.as_str())
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    value
+                                        .get("assets")
+                                        .and_then(|x| x.as_array())
+                                        .and_then(|items| items.first())
+                                        .and_then(|asset| asset.get("id"))
+                                        .and_then(|x| x.as_str())
+                                        .map(str::to_string)
+                                })
+                        })
+                };
+
+                let Some(thumbnail_id) = thumbnail_id else {
+                    let _ = tx.send(ThumbnailEvent::Failed { album_id });
+                    continue;
+                };
+
+                let result = client
+                    .get(format!("{}/api/assets/{}/thumbnail?size=thumbnail", base, thumbnail_id))
+                    .header("x-api-key", &api_key)
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.bytes());
+
+                match result {
+                    Ok(bytes) => {
+                        let _ = tx.send(ThumbnailEvent::Loaded {
+                            album_id,
+                            bytes: bytes.to_vec(),
+                        });
+                    }
+                    Err(_) => {
+                        let _ = tx.send(ThumbnailEvent::Failed { album_id });
+                    }
+                }
+            });
+        }
+    }
+
+    fn poll_thumbnail_events(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.thumbnail_receiver else { return; };
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+
+        for event in events {
+            match event {
+                ThumbnailEvent::Loaded { album_id, bytes } => {
+                    if let Ok(decoded) = image::load_from_memory(&bytes) {
+                        let rgba = decoded.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                        let texture = ctx.load_texture(
+                            format!("album_thumbnail_{}", album_id),
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        if let Some(item) = self.albums.iter_mut().find(|x| x.album.id == album_id) {
+                            item.thumbnail = Some(texture);
+                        }
+                    }
+                }
+                ThumbnailEvent::Failed { album_id: _ } => {}
+            }
+        }
+    }
+
+    fn load_no_album_years(&mut self) -> Result<(), String> {
+        let base = self.base_url()?;
+        let key = self.ensure_api_key()?.to_string();
+        let client = self.client()?;
+        self.no_album_assets.clear();
+        self.year_buckets.clear();
+        self.status = "Lade Fotos ohne Album nach Jahr ...".to_owned();
+
+        let mut page = 1_i64;
+        let mut seen_pages = HashSet::<i64>::new();
+
+        loop {
+            if !seen_pages.insert(page) {
+                return Err(format!("Seitennavigation wiederholt Seite {}. Abbruch zum Schutz vor einer Endlosschleife.", page));
+            }
+
+            let body = json!({"isNotInAlbum": true, "page": page, "size": 1000});
+            let resp = client
+                .post(format!("{}/api/search/metadata", base))
+                .header("x-api-key", &key)
+                .json(&body)
+                .send()
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+
+            let value: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            let (items, next_page) = Self::search_items_and_next(&value);
+            let assets: Vec<Asset> = serde_json::from_value(items).map_err(|e| e.to_string())?;
+            let returned_count = assets.len();
+
+            for asset in assets {
+                if Self::media_matches(&asset, self.media_mode) {
+                    self.no_album_assets.push(asset);
+                }
+            }
+
+            if let Some(next) = Self::parse_next_page(next_page) {
+                if next == page {
+                    break;
+                }
+                page = next;
+            } else {
+                // Kein nextPage bedeutet laut API: letzte Seite.
+                // returned_count wird nur für die Status-/Plausibilitätslogik behalten.
+                let _ = returned_count;
+                break;
+            }
+        }
+
+        self.rebuild_year_buckets();
+        self.status = format!(
+            "{} Fotos/Videos ohne Album geladen, gruppiert in {} Jahresordner.",
+            self.no_album_assets.len(),
+            self.year_buckets.len()
+        );
+        Ok(())
+    }
+
+    fn load_all_assets_by_year(&mut self) -> Result<(), String> {
+        let base = self.base_url()?;
+        let key = self.ensure_api_key()?.to_string();
+        let client = self.client()?;
+
+        self.all_assets.clear();
+        self.all_year_buckets.clear();
+        self.status = "Lade alle Fotos nach Jahr ...".to_owned();
+
+        let mut page = 1_i64;
+        let mut seen_pages = HashSet::<i64>::new();
+
+        loop {
+            if !seen_pages.insert(page) {
+                return Err(format!(
+                    "Seitennavigation wiederholt Seite {}. Abbruch zum Schutz vor einer Endlosschleife.",
+                    page
+                ));
+            }
+
+            let body = json!({
+                "page": page,
+                "size": 1000
+            });
+
+            let resp = client
+                .post(format!("{}/api/search/metadata", base))
+                .header("x-api-key", &key)
+                .json(&body)
+                .send()
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+
+            let value: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            let (items, next_page) = Self::search_items_and_next(&value);
+            let assets: Vec<Asset> =
+                serde_json::from_value(items).map_err(|e| e.to_string())?;
+
+            for asset in assets {
+                if Self::media_matches(&asset, self.media_mode) {
+                    self.all_assets.push(asset);
+                }
+            }
+
+            if let Some(next) = Self::parse_next_page(next_page) {
+                if next == page {
+                    break;
+                }
+                page = next;
+            } else {
+                break;
+            }
+        }
+
+        self.rebuild_all_year_buckets();
+
+        self.status = format!(
+            "{} Fotos/Videos insgesamt geladen, gruppiert in {} Jahresordner.",
+            self.all_assets.len(),
+            self.all_year_buckets.len()
+        );
+
+        Ok(())
+    }
+
+    fn rebuild_all_year_buckets(&mut self) {
+        let selected: HashSet<String> = self
+            .all_year_buckets
+            .iter()
+            .filter(|x| x.selected)
+            .map(|x| x.year.clone())
+            .collect();
+
+        let mut map: BTreeMap<String, (usize, i64)> = BTreeMap::new();
+
+        for asset in &self.all_assets {
+            let year = Self::asset_year(asset);
+            let entry = map.entry(year).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += asset.file_size_in_byte.max(0);
+        }
+
+        self.all_year_buckets = map
+            .into_iter()
+            .rev()
+            .map(|(year, (count, total_size))| YearBucket {
+                selected: selected.contains(&year),
+                year,
+                count,
+                total_size,
+            })
+            .collect();
+    }
+
+    fn search_items_and_next(value: &serde_json::Value) -> (serde_json::Value, Option<serde_json::Value>) {
+        if let Some(assets) = value.get("assets") {
+            (
+                assets.get("items").cloned().unwrap_or_else(|| json!([])),
+                assets.get("nextPage").cloned(),
+            )
+        } else {
+            (
+                value.get("items").cloned().unwrap_or_else(|| json!([])),
+                value.get("nextPage").cloned(),
+            )
+        }
+    }
+
+    fn parse_next_page(value: Option<serde_json::Value>) -> Option<i64> {
+        match value {
+            Some(serde_json::Value::Number(n)) => n.as_i64(),
+            Some(serde_json::Value::String(s)) => s.parse::<i64>().ok(),
+            _ => None,
+        }
+    }
+
+    fn rebuild_year_buckets(&mut self) {
+        let selected: HashSet<String> = self.year_buckets.iter().filter(|x| x.selected).map(|x| x.year.clone()).collect();
+        let mut map: BTreeMap<String, (usize, i64)> = BTreeMap::new();
+        for asset in &self.no_album_assets {
+            let year = Self::asset_year(asset);
+            let entry = map.entry(year).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += asset.file_size_in_byte.max(0);
+        }
+        self.year_buckets = map
+            .into_iter()
+            .rev()
+            .map(|(year, (count, total_size))| YearBucket {
+                selected: selected.contains(&year),
+                year,
+                count,
+                total_size,
+            })
+            .collect();
+    }
+
+    fn asset_file_name(asset: &Asset) -> String {
+        if !asset.original_file_name.trim().is_empty() {
+            return Path::new(&asset.original_file_name)
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_else(|| asset.original_file_name.clone());
+        }
+        if !asset.device_asset_id.trim().is_empty() {
+            return Path::new(&asset.device_asset_id)
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_else(|| asset.device_asset_id.clone());
+        }
+        format!("{}.bin", asset.id)
+    }
+
+    fn asset_year(asset: &Asset) -> String {
+        let dt = asset.local_date_time.trim();
+        if dt.len() >= 4 && dt.chars().take(4).all(|c| c.is_ascii_digit()) {
+            return dt[0..4].to_string();
+        }
+        let name = Self::asset_file_name(asset);
+        let digits: String = name.chars().filter(|c| c.is_ascii_digit()).collect();
+        for i in 0..digits.len().saturating_sub(3) {
+            let part = &digits[i..i + 4];
+            if let Ok(year) = part.parse::<i32>() {
+                if (1900..=2100).contains(&year) {
+                    return part.to_string();
+                }
+            }
+        }
+        "Unbekannt".to_string()
+    }
+
+    fn sanitize_file_name(name: &str) -> String {
+        let bad = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+        let mut out: String = name.chars().map(|c| if bad.contains(&c) || c < ' ' { '_' } else { c }).collect();
+        while out.ends_with('.') || out.ends_with(' ') {
+            out.pop();
+        }
+        if out.is_empty() { "Unbenannt".to_string() } else { out }
+    }
+
+    fn duplicate_key(asset: &Asset) -> String {
+        if !asset.checksum.trim().is_empty() {
+            format!("checksum:{}", asset.checksum)
+        } else {
+            format!(
+                "fallback:{}|{}|{}",
+                Self::asset_file_name(asset).to_lowercase(),
+                asset.local_date_time,
+                asset.asset_type
+            )
+        }
+    }
+
+    fn deduplicate_jobs(jobs: Vec<DownloadJob>) -> Vec<DownloadJob> {
+        let mut best: HashMap<String, DownloadJob> = HashMap::new();
+        for job in jobs {
+            let key = Self::duplicate_key(&job.asset);
+            match best.get(&key) {
+                Some(existing) if existing.asset.file_size_in_byte >= job.asset.file_size_in_byte => {}
+                _ => { best.insert(key, job); }
+            }
+        }
+        best.into_values().collect()
+    }
+
+
+    fn deduplicate_queue_jobs(jobs: Vec<DownloadJob>) -> Vec<DownloadJob> {
+        // Technische Pflicht-Deduplizierung vor parallelen Downloads:
+        // 1) dieselbe Immich-Asset-ID darf nur einmal pro Zielpfad in die Queue
+        // 2) derselbe Zielpfad darf nur einmal gleichzeitig verarbeitet werden
+        // Dadurch kann ein Worker eine Datei nicht herunterladen, während ein
+        // anderer Worker dieselbe Datei kurz danach fälschlich als "vorhanden"
+        // erkennt.
+        let mut by_asset_and_path: HashMap<String, DownloadJob> = HashMap::new();
+
+        for job in jobs {
+            let file_name = Self::sanitize_file_name(&Self::asset_file_name(&job.asset));
+            let target_key = format!(
+                "{}\\{}",
+                job.folder_name.to_lowercase(),
+                file_name.to_lowercase()
+            );
+            let key = format!("{}|{}", job.asset.id, target_key);
+
+            match by_asset_and_path.get(&key) {
+                Some(existing)
+                    if existing.asset.file_size_in_byte >= job.asset.file_size_in_byte => {}
+                _ => {
+                    by_asset_and_path.insert(key, job);
+                }
+            }
+        }
+
+        // Zweite Sicherung nur nach Zielpfad. Falls zwei verschiedene Asset-IDs
+        // auf exakt denselben Dateinamen im selben Ordner zeigen, bleibt die
+        // größere bekannte Version in der Queue.
+        let mut by_target_path: HashMap<String, DownloadJob> = HashMap::new();
+        for job in by_asset_and_path.into_values() {
+            let file_name = Self::sanitize_file_name(&Self::asset_file_name(&job.asset));
+            let target_key = format!(
+                "{}\\{}",
+                job.folder_name.to_lowercase(),
+                file_name.to_lowercase()
+            );
+
+            match by_target_path.get(&target_key) {
+                Some(existing)
+                    if existing.asset.file_size_in_byte >= job.asset.file_size_in_byte => {}
+                _ => {
+                    by_target_path.insert(target_key, job);
+                }
+            }
+        }
+
+        by_target_path.into_values().collect()
+    }
+
+    fn format_bytes_i64(bytes: i64) -> String {
+        if bytes <= 0 {
+            "unbekannt".to_string()
+        } else {
+            Self::format_bytes_u64(bytes as u64)
+        }
+    }
+
+    fn format_bytes_u64(bytes: u64) -> String {
+        if bytes < 1024 {
+            format!("{} B", bytes)
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else if bytes < 1024 * 1024 * 1024 {
+            format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+        } else {
+            format!("{:.1} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+        }
+    }
+
+    fn remote_original_size(
+        client: &Client,
+        base: &str,
+        api_key: &str,
+        asset_id: &str,
+    ) -> Option<u64> {
+        let url = format!("{}/api/assets/{}/original", base, asset_id);
+
+        // Zuerst HEAD versuchen: schnell und ohne Dateidaten.
+        if let Ok(response) = client
+            .head(&url)
+            .header("x-api-key", api_key)
+            .send()
+        {
+            if response.status().is_success() {
+                if let Some(len) = response.content_length() {
+                    if len > 0 {
+                        return Some(len);
+                    }
+                }
+            }
+        }
+
+        // Falls HEAD nicht unterstützt wird: nur das erste Byte anfordern.
+        // Aus "Content-Range: bytes 0-0/GESAMT" lässt sich die echte
+        // Größe bestimmen, ohne die komplette Datei herunterzuladen.
+        if let Ok(response) = client
+            .get(&url)
+            .header("x-api-key", api_key)
+            .header(RANGE, "bytes=0-0")
+            .send()
+        {
+            if response.status().is_success()
+                || response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            {
+                if let Some(value) = response.headers().get(CONTENT_RANGE) {
+                    if let Ok(text) = value.to_str() {
+                        if let Some(total) = text.rsplit('/').next() {
+                            if total != "*" {
+                                if let Ok(size) = total.parse::<u64>() {
+                                    if size > 0 {
+                                        return Some(size);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Manche Server ignorieren Range und liefern bei GET trotzdem
+                // einen korrekten Content-Length-Header.
+                if let Some(len) = response.content_length() {
+                    if len > 1 {
+                        return Some(len);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn selected_album_count(&self) -> usize {
+        self.albums.iter().filter(|x| x.selected).count()
+    }
+
+    fn selected_all_year_count(&self) -> usize {
+        self.all_year_buckets.iter().filter(|x| x.selected).count()
+    }
+
+    fn selected_all_year_asset_count(&self) -> usize {
+        self.all_year_buckets
+            .iter()
+            .filter(|x| x.selected)
+            .map(|x| x.count)
+            .sum()
+    }
+
+    fn selected_year_count(&self) -> usize {
+        self.year_buckets.iter().filter(|x| x.selected).count()
+    }
+
+    fn selected_year_asset_count(&self) -> usize {
+        self.year_buckets.iter().filter(|x| x.selected).map(|x| x.count).sum()
+    }
+
+    fn start_background_download(&mut self) -> Result<(), String> {
+        if self.download_running {
+            return Err("Ein Download läuft bereits.".to_string());
+        }
+
+        let target_dir = self.target_dir.trim().to_string();
+        if target_dir.is_empty() {
+            return Err("Bitte zuerst ein Download-Verzeichnis auswählen.".to_string());
+        }
+
+        let base = self.base_url()?;
+        let api_key = self.ensure_api_key()?.to_string();
+        let selected_albums: Vec<Album> = if self.active_tab == ActiveTab::Albums {
+            self.albums.iter().filter(|x| x.selected).map(|x| x.album.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let selected_years: Vec<String> = if self.active_tab == ActiveTab::NoAlbum {
+            self.year_buckets.iter().filter(|x| x.selected).map(|x| x.year.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let selected_all_years: Vec<String> = if self.active_tab == ActiveTab::AllByYear {
+            self.all_year_buckets.iter().filter(|x| x.selected).map(|x| x.year.clone()).collect()
+        } else {
+            Vec::new()
+        };
+
+        if selected_albums.is_empty() && selected_years.is_empty() && selected_all_years.is_empty() {
+            return Err("Bitte mindestens ein Album oder einen Jahresordner auswählen.".to_string());
+        }
+
+        let no_album_assets = self.no_album_assets.clone();
+        let all_assets = self.all_assets.clone();
+        let media_mode = self.media_mode;
+        let existing_mode = self.existing_mode;
+        let deduplicate = self.deduplicate;
+        let parallel_downloads = self.parallel_downloads.max(1);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_for_thread = Arc::clone(&cancel_flag);
+
+        let (tx, rx) = mpsc::channel::<DownloadEvent>();
+        self.download_receiver = Some(rx);
+        self.download_cancel = Some(cancel_flag);
+        self.download_running = true;
+        self.download_popup = true;
+        self.download_current = 0;
+        self.download_total = 0;
+        self.download_file = "Download wird vorbereitet ...".to_string();
+        self.download_downloaded = 0;
+        self.download_skipped = 0;
+        self.download_failed = 0;
+        self.download_active = 0;
+        self.download_album_current = 0;
+        self.download_album_total = selected_albums.len();
+        self.download_album_name.clear();
+        self.progress = 0.0;
+        self.status = "Download gestartet ...".to_string();
+
+        thread::spawn(move || {
+            let client = match Client::builder().timeout(Duration::from_secs(600)).build() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(DownloadEvent::Error(e.to_string()));
+                    return;
+                }
+            };
+
+            if let Err(e) = fs::create_dir_all(&target_dir) {
+                let _ = tx.send(DownloadEvent::Error(format!("Zielordner konnte nicht erstellt werden: {}", e)));
+                return;
+            }
+
+            let mut jobs: Vec<DownloadJob> = Vec::new();
+            let album_total = selected_albums.len();
+
+            for (album_index, album) in selected_albums.into_iter().enumerate() {
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    let _ = tx.send(DownloadEvent::Finished {
+                        downloaded: 0,
+                        skipped: 0,
+                        failed: 0,
+                        conflicts: Vec::new(),
+                        cancelled: true,
+                    });
+                    return;
+                }
+
+                let _ = tx.send(DownloadEvent::AlbumProgress {
+                    current: album_index + 1,
+                    total: album_total,
+                    album_name: album.album_name.clone(),
+                });
+                let _ = tx.send(DownloadEvent::Preparing(format!("Lese Album: {}", album.album_name)));
+
+                let mut page = 1_i64;
+                loop {
+                    if cancel_for_thread.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let body = json!({"albumIds": [album.id.clone()], "page": page, "size": 1000});
+                    let resp = client
+                        .post(format!("{}/api/search/metadata", base))
+                        .header("x-api-key", &api_key)
+                        .json(&body)
+                        .send()
+                        .and_then(|r| r.error_for_status());
+
+                    let resp = match resp {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx.send(DownloadEvent::Error(format!("Album '{}' konnte nicht geladen werden: {}", album.album_name, e)));
+                            return;
+                        }
+                    };
+
+                    let value: serde_json::Value = match resp.json() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx.send(DownloadEvent::Error(format!("Album '{}' lieferte ungültige Daten: {}", album.album_name, e)));
+                            return;
+                        }
+                    };
+
+                    let (items, next_page) = Self::search_items_and_next(&value);
+                    let assets: Vec<Asset> = match serde_json::from_value(items) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx.send(DownloadEvent::Error(format!("Album '{}' konnte nicht ausgewertet werden: {}", album.album_name, e)));
+                            return;
+                        }
+                    };
+
+                    for asset in assets {
+                        if Self::media_matches(&asset, media_mode) {
+                            jobs.push(DownloadJob {
+                                asset,
+                                folder_name: Self::sanitize_file_name(&album.album_name),
+                                group_name: album.album_name.clone(),
+                                album_position: Some((album_index + 1, album_total)),
+                            });
+                        }
+                    }
+
+                    if let Some(next) = Self::parse_next_page(next_page) {
+                        page = next;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            for year in selected_years {
+                for asset in &no_album_assets {
+                    if Self::asset_year(asset) == year && Self::media_matches(asset, media_mode) {
+                        jobs.push(DownloadJob {
+                            asset: asset.clone(),
+                            folder_name: format!("Ohne Album\\{}", year),
+                            group_name: format!("Ohne Album {}", year),
+                            album_position: None,
+                        });
+                    }
+                }
+            }
+
+            for year in selected_all_years {
+                for asset in &all_assets {
+                    if Self::asset_year(asset) == year && Self::media_matches(asset, media_mode) {
+                        jobs.push(DownloadJob {
+                            asset: asset.clone(),
+                            folder_name: format!("Alle Fotos nach Jahr\\{}", year),
+                            group_name: format!("Alle Fotos {}", year),
+                            album_position: None,
+                        });
+                    }
+                }
+            }
+
+            if deduplicate {
+                jobs = Self::deduplicate_jobs(jobs);
+            }
+
+            // Unabhängig von der Benutzeroption muss die parallele Queue frei
+            // von doppelten Asset-/Zielpfad-Einträgen sein.
+            jobs = Self::deduplicate_queue_jobs(jobs);
+
+            if jobs.is_empty() {
+                let _ = tx.send(DownloadEvent::Error("Die Auswahl enthält keine passenden Dateien.".to_string()));
+                return;
+            }
+
+            let total = jobs.len();
+            let _ = tx.send(DownloadEvent::Prepared(total));
+
+            let mut group_order: Vec<String> = Vec::new();
+            let mut groups: HashMap<String, Vec<DownloadJob>> = HashMap::new();
+            for job in jobs {
+                if !groups.contains_key(&job.group_name) {
+                    group_order.push(job.group_name.clone());
+                }
+                groups.entry(job.group_name.clone()).or_default().push(job);
+            }
+
+            let downloaded = Arc::new(AtomicUsize::new(0));
+            let skipped = Arc::new(AtomicUsize::new(0));
+            let failed = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let active = Arc::new(AtomicUsize::new(0));
+            let conflicts = Arc::new(Mutex::new(Vec::<ConflictItem>::new()));
+            let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+
+            for group_name in group_order {
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let group_jobs = groups.remove(&group_name).unwrap_or_default();
+                if let Some((current, album_total)) = group_jobs.first().and_then(|j| j.album_position) {
+                    let _ = tx.send(DownloadEvent::AlbumProgress {
+                        current,
+                        total: album_total,
+                        album_name: group_name.clone(),
+                    });
+                } else {
+                    let _ = tx.send(DownloadEvent::Preparing(format!("Jahresordner: {}", group_name)));
+                }
+
+                Self::download_group_parallel(
+                    group_jobs,
+                    parallel_downloads,
+                    &client,
+                    &base,
+                    &api_key,
+                    &target_dir,
+                    existing_mode,
+                    &tx,
+                    total,
+                    &cancel_for_thread,
+                    &downloaded,
+                    &skipped,
+                    &failed,
+                    &completed,
+                    &active,
+                    &conflicts,
+                    &errors,
+                );
+            }
+
+            if let Ok(errors) = errors.lock() {
+                if !errors.is_empty() {
+                    let error_path = Path::new(&target_dir).join("Immich_Download_Fehler.txt");
+                    if let Ok(mut file) = fs::File::create(error_path) {
+                        for line in errors.iter() {
+                            let _ = writeln!(file, "{}", line);
+                        }
+                    }
+                }
+            }
+
+            let conflict_list = conflicts.lock().map(|x| x.clone()).unwrap_or_default();
+            let _ = tx.send(DownloadEvent::Finished {
+                downloaded: downloaded.load(Ordering::Relaxed),
+                skipped: skipped.load(Ordering::Relaxed),
+                failed: failed.load(Ordering::Relaxed),
+                conflicts: conflict_list,
+                cancelled: cancel_for_thread.load(Ordering::Relaxed),
+            });
+        });
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn download_group_parallel(
+        jobs: Vec<DownloadJob>,
+        parallel_downloads: usize,
+        client: &Client,
+        base: &str,
+        api_key: &str,
+        target_dir: &str,
+        existing_mode: ExistingMode,
+        tx: &Sender<DownloadEvent>,
+        total: usize,
+        cancel: &Arc<AtomicBool>,
+        downloaded: &Arc<AtomicUsize>,
+        skipped: &Arc<AtomicUsize>,
+        failed: &Arc<AtomicUsize>,
+        completed: &Arc<AtomicUsize>,
+        active: &Arc<AtomicUsize>,
+        conflicts: &Arc<Mutex<Vec<ConflictItem>>>,
+        errors: &Arc<Mutex<Vec<String>>>,
+    ) {
+        let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+        let mut handles = Vec::new();
+        let worker_count = parallel_downloads.min(queue.lock().map(|q| q.len()).unwrap_or(1)).max(1);
+
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let client = client.clone();
+            let base = base.to_string();
+            let api_key = api_key.to_string();
+            let target_dir = target_dir.to_string();
+            let tx = tx.clone();
+            let cancel = Arc::clone(cancel);
+            let downloaded = Arc::clone(downloaded);
+            let skipped = Arc::clone(skipped);
+            let failed = Arc::clone(failed);
+            let completed = Arc::clone(completed);
+            let active = Arc::clone(active);
+            let conflicts = Arc::clone(conflicts);
+            let errors = Arc::clone(errors);
+
+            handles.push(thread::spawn(move || {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let job = {
+                        let mut queue = match queue.lock() {
+                            Ok(q) => q,
+                            Err(_) => break,
+                        };
+                        queue.pop_front()
+                    };
+
+                    let Some(job) = job else { break; };
+                    active.fetch_add(1, Ordering::Relaxed);
+                    let file_name = Self::asset_file_name(&job.asset);
+                    let folder = Path::new(&target_dir).join(&job.folder_name);
+
+                    if let Err(e) = fs::create_dir_all(&folder) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut err) = errors.lock() {
+                            err.push(format!("{} : {}", file_name, e));
+                        }
+                    } else {
+                        let target_path = folder.join(Self::sanitize_file_name(&file_name));
+
+                        if target_path.exists() && existing_mode == ExistingMode::Ask {
+                            let local_size = fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
+
+                            // Tatsächliche Größe der Immich-Originaldatei ermitteln.
+                            let remote_size = Self::remote_original_size(
+                                &client,
+                                &base,
+                                &api_key,
+                                &job.asset.id,
+                            );
+
+                            // Gleich große Dateien sind für diesen Workflow bereits
+                            // vollständig vorhanden und werden automatisch übersprungen.
+                            // Sie erscheinen NICHT mehr im Konfliktfenster.
+                            if remote_size == Some(local_size) {
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                if let Ok(mut list) = conflicts.lock() {
+                                    list.push(ConflictItem {
+                                        job: job.clone(),
+                                        selected: false,
+                                        local_size,
+                                        remote_size,
+                                    });
+                                }
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else if !cancel.load(Ordering::Relaxed) {
+                            let result = client
+                                .get(format!("{}/api/assets/{}/original", base, job.asset.id))
+                                .header("x-api-key", &api_key)
+                                .send()
+                                .and_then(|r| r.error_for_status());
+
+                            match result {
+                                Ok(mut response) => match fs::File::create(&target_path) {
+                                    Ok(mut file) => match response.copy_to(&mut file) {
+                                        Ok(_) => { downloaded.fetch_add(1, Ordering::Relaxed); }
+                                        Err(e) => {
+                                            failed.fetch_add(1, Ordering::Relaxed);
+                                            if let Ok(mut err) = errors.lock() {
+                                                err.push(format!("{} : {}", file_name, e));
+                                            }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                        if let Ok(mut err) = errors.lock() {
+                                            err.push(format!("{} : {}", file_name, e));
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    if let Ok(mut err) = errors.lock() {
+                                        err.push(format!("{} : {}", file_name, e));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(DownloadEvent::Progress {
+                        current,
+                        total,
+                        file_name,
+                        downloaded: downloaded.load(Ordering::Relaxed),
+                        skipped: skipped.load(Ordering::Relaxed),
+                        failed: failed.load(Ordering::Relaxed),
+                        active: active.load(Ordering::Relaxed),
+                    });
+                }
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    fn start_conflict_overwrite(&mut self, jobs: Vec<DownloadJob>) -> Result<(), String> {
+        if jobs.is_empty() {
+            return Err("Keine Dateien zum Überschreiben ausgewählt.".to_string());
+        }
+        if self.download_running {
+            return Err("Ein Download läuft bereits.".to_string());
+        }
+
+        let base = self.base_url()?;
+        let api_key = self.ensure_api_key()?.to_string();
+        let target_dir = self.target_dir.clone();
+        let parallel_downloads = self.parallel_downloads.max(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel::<DownloadEvent>();
+
+        self.download_receiver = Some(rx);
+        self.download_cancel = Some(cancel);
+        self.download_running = true;
+        self.download_popup = true;
+        self.conflict_popup = false;
+        self.download_current = 0;
+        self.download_total = jobs.len();
+        self.download_file = "Vorhandene Dateien werden überschrieben ...".to_string();
+        self.download_downloaded = 0;
+        self.download_skipped = 0;
+        self.download_failed = 0;
+        self.download_active = 0;
+        self.progress = 0.0;
+
+        thread::spawn(move || {
+            let client = match Client::builder().timeout(Duration::from_secs(600)).build() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(DownloadEvent::Error(e.to_string()));
+                    return;
+                }
+            };
+            let total = jobs.len();
+            let _ = tx.send(DownloadEvent::Prepared(total));
+            let downloaded = Arc::new(AtomicUsize::new(0));
+            let skipped = Arc::new(AtomicUsize::new(0));
+            let failed = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let active = Arc::new(AtomicUsize::new(0));
+            let conflicts = Arc::new(Mutex::new(Vec::<ConflictItem>::new()));
+            let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+
+            Self::download_group_parallel(
+                jobs,
+                parallel_downloads,
+                &client,
+                &base,
+                &api_key,
+                &target_dir,
+                ExistingMode::Overwrite,
+                &tx,
+                total,
+                &cancel_thread,
+                &downloaded,
+                &skipped,
+                &failed,
+                &completed,
+                &active,
+                &conflicts,
+                &errors,
+            );
+
+            let _ = tx.send(DownloadEvent::Finished {
+                downloaded: downloaded.load(Ordering::Relaxed),
+                skipped: 0,
+                failed: failed.load(Ordering::Relaxed),
+                conflicts: Vec::new(),
+                cancelled: cancel_thread.load(Ordering::Relaxed),
+            });
+        });
+
+        Ok(())
+    }
+
+    fn poll_download_events(&mut self) {
+        let mut pending = Vec::new();
+        if let Some(rx) = &self.download_receiver {
+            while let Ok(event) = rx.try_recv() {
+                pending.push(event);
+            }
+        }
+
+        for event in pending {
+            match event {
+                DownloadEvent::Preparing(text) => {
+                    self.download_file = text.clone();
+                    self.status = text;
+                }
+                DownloadEvent::AlbumProgress { current, total, album_name } => {
+                    self.download_album_current = current;
+                    self.download_album_total = total;
+                    self.download_album_name = album_name.clone();
+                    self.download_file = format!("Album {} von {}: {}", current, total, album_name);
+                }
+                DownloadEvent::Prepared(total) => {
+                    // Jeder neue Download beginnt sichtbar bei 0 %.
+                    self.download_total = total;
+                    self.download_current = 0;
+                    self.download_downloaded = 0;
+                    self.download_skipped = 0;
+                    self.download_failed = 0;
+                    self.download_active = 0;
+                    self.progress = 0.0;
+                }
+                DownloadEvent::Progress { current, total, file_name, downloaded, skipped, failed, active } => {
+                    self.download_current = current;
+                    self.download_total = total;
+                    self.download_file = file_name;
+                    self.download_downloaded = downloaded;
+                    self.download_skipped = skipped;
+                    self.download_failed = failed;
+                    self.download_active = active;
+                    self.progress = if total > 0 { current as f32 / total as f32 } else { 0.0 };
+                }
+                DownloadEvent::Finished { downloaded, skipped, failed, conflicts, cancelled } => {
+                    self.download_running = false;
+                    self.download_downloaded = downloaded;
+                    self.download_skipped = skipped;
+                    self.download_failed = failed;
+                    self.download_active = 0;
+                    if !cancelled {
+                        self.progress = 1.0;
+                    }
+                    self.status = if cancelled {
+                        format!("Abgebrochen. Heruntergeladen: {} | Vorhanden: {} | Fehler: {}", downloaded, skipped, failed)
+                    } else {
+                        format!("Fertig. Heruntergeladen: {} | Vorhanden: {} | Fehler: {}", downloaded, skipped, failed)
+                    };
+                    self.download_file = if cancelled { "Download abgebrochen.".to_string() } else { "Download abgeschlossen.".to_string() };
+                    self.conflicts = conflicts;
+                    if !self.conflicts.is_empty() && !cancelled {
+                        self.conflict_index = 0;
+                        self.conflict_preview_key.clear();
+                        self.conflict_local_texture = None;
+                        self.conflict_remote_texture = None;
+                        self.conflict_local_dims = None;
+                        self.conflict_remote_dims = None;
+                        self.conflict_zoom_open = false;
+                        self.conflict_zoom_texture = None;
+                        self.conflict_popup = true;
+                    }
+                }
+                DownloadEvent::Error(msg) => {
+                    self.download_running = false;
+                    self.download_file = format!("Fehler: {}", msg);
+                    self.status = self.download_file.clone();
+                }
+            }
+        }
+
+        if !self.download_running {
+            self.download_receiver = None;
+            self.download_cancel = None;
+        }
+    }
+
+    fn draw_logo(&self, ui: &mut egui::Ui) {
+        if let Some(texture) = &self.logo_texture {
+            ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(42.0, 42.0)));
+        }
+    }
+
+    fn ui_header(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(egui::Color32::WHITE)
+            .inner_margin(egui::Margin::symmetric(18.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    self.draw_logo(ui);
+                    ui.vertical(|ui| {
+                        ui.heading(egui::RichText::new("Immich Backup Manager").size(24.0).strong());
+                        ui.label(
+                            egui::RichText::new(
+                                "Originalfotos und -videos aus Immich für Backups nach Alben und Jahren herunterladen",
+                            )
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(90, 98, 112)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("ⓘ  Info").clicked() {
+                            self.info_popup = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Immich-Server");
+                    ui.add_sized([390.0, 30.0], egui::TextEdit::singleline(&mut self.server));
+                    ui.add_space(8.0);
+                    ui.label("API-Key");
+                    if self.show_key {
+                        ui.add_sized([320.0, 30.0], egui::TextEdit::singleline(&mut self.api_key));
+                    } else {
+                        ui.add_sized([320.0, 30.0], egui::TextEdit::singleline(&mut self.api_key).password(true));
+                    }
+                    if ui.button(if self.show_key { "Verbergen" } else { "Anzeigen" }).clicked() {
+                        self.show_key = !self.show_key;
+                    }
+                    let test_button = egui::Button::new(
+                        egui::RichText::new("Verbindung testen / Alben laden")
+                            .color(egui::Color32::from_rgb(20, 105, 235))
+                            .strong(),
+                    )
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(20, 105, 235)));
+                    if ui.add(test_button).clicked() {
+                        match self.load_albums() {
+                            Ok(()) => {
+                                if let Err(e) = save_settings(&self.server, &self.api_key) {
+                                    self.status = format!("Verbindung erfolgreich, Speichern fehlgeschlagen: {}", e);
+                                }
+                            }
+                            Err(e) => self.status = format!("Fehler: {}", e),
+                        }
+                    }
+                    let delete_button = egui::Button::new(
+                        egui::RichText::new("Gespeicherten API-Key löschen")
+                            .color(egui::Color32::from_rgb(210, 50, 50)),
+                    )
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(225, 80, 80)));
+                    if ui.add(delete_button).clicked() {
+                        self.api_key.clear();
+                        match delete_saved_settings() {
+                            Ok(()) => self.status = "Gespeicherter API-Key wurde gelöscht.".to_string(),
+                            Err(e) => self.status = format!("API-Key konnte nicht gelöscht werden: {}", e),
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("media_type_combo")
+                        .selected_text(match self.media_mode {
+                            MediaMode::All => "Fotos und Videos",
+                            MediaMode::Photos => "Nur Fotos",
+                            MediaMode::Videos => "Nur Videos",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.media_mode, MediaMode::All, "Fotos und Videos");
+                            ui.selectable_value(&mut self.media_mode, MediaMode::Photos, "Nur Fotos");
+                            ui.selectable_value(&mut self.media_mode, MediaMode::Videos, "Nur Videos");
+                        });
+                    ui.checkbox(&mut self.own_albums, "Eigene Alben");
+                    ui.checkbox(&mut self.shared_albums, "Geteilte Alben");
+                });
+            });
+    }
+
+    fn ui_right_panel(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(ui.available_width());
+        egui::ScrollArea::vertical()
+            .id_salt("download_settings_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::WHITE)
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 219, 226)))
+                    .rounding(egui::Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(20.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.heading(egui::RichText::new("Download & Einstellungen").size(22.0).strong());
+                        ui.add_space(18.0);
+
+                        ui.label(egui::RichText::new("Zielordner").strong());
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let edit_width = (ui.available_width() - 132.0).max(170.0);
+                            ui.add_sized(
+                                [edit_width, 38.0],
+                                egui::TextEdit::singleline(&mut self.target_dir)
+                                    .hint_text("Backup-Ordner auswählen"),
+                            );
+                            if ui.add_sized([120.0, 38.0], egui::Button::new("Durchsuchen …")).clicked() {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    self.target_dir = folder.to_string_lossy().to_string();
+                                }
+                            }
+                        });
+
+                        ui.add_space(18.0);
+                        ui.label(egui::RichText::new("Vorhandene Dateien").strong());
+                        ui.add_space(6.0);
+                        egui::ComboBox::from_id_salt("existing_mode_combo")
+                            .selected_text(match self.existing_mode {
+                                ExistingMode::Ask => "Vergleichen / nachfragen",
+                                ExistingMode::Overwrite => "Direkt überschreiben",
+                            })
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.existing_mode, ExistingMode::Ask, "Vergleichen / nachfragen");
+                                ui.selectable_value(&mut self.existing_mode, ExistingMode::Overwrite, "Direkt überschreiben");
+                            });
+
+                        ui.add_space(18.0);
+                        ui.label(egui::RichText::new("Parallele Downloads").strong());
+                        ui.add_space(6.0);
+                        egui::ComboBox::from_id_salt("parallel_downloads_combo")
+                            .selected_text(format!("{} gleichzeitig", self.parallel_downloads))
+                            .width(190.0)
+                            .show_ui(ui, |ui| {
+                                for n in [1usize, 2, 4, 6, 8, 12] {
+                                    ui.selectable_value(&mut self.parallel_downloads, n, format!("{} gleichzeitig", n));
+                                }
+                            });
+
+                        let selected_count = self.selected_album_count()
+                            + self.selected_year_count()
+                            + self.selected_all_year_count();
+                        let target_missing = self.target_dir.trim().is_empty();
+                        let can_download = !self.download_running && selected_count > 0 && !target_missing;
+
+                        ui.add_space(22.0);
+                        let button_text = if self.download_running {
+                            "Download läuft …"
+                        } else {
+                            "↓  Herunterladen"
+                        };
+                        let button_fill = if can_download || self.download_running {
+                            egui::Color32::from_rgb(20, 105, 235)
+                        } else {
+                            egui::Color32::from_rgb(147, 180, 229)
+                        };
+                        let download_button = egui::Button::new(
+                            egui::RichText::new(button_text)
+                                .color(egui::Color32::WHITE)
+                                .strong()
+                                .size(18.0),
+                        )
+                        .fill(button_fill)
+                        .rounding(egui::Rounding::same(8.0))
+                        .min_size(egui::vec2(ui.available_width(), 52.0));
+                        let response = ui.add_enabled(can_download, download_button);
+                        if response.clicked() {
+                            if let Err(e) = self.start_background_download() {
+                                self.status = format!("Fehler: {}", e);
+                            }
+                        }
+
+                        // Reservierter Hinweisbereich: verhindert ein Springen des Layouts.
+                        ui.add_space(6.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 42.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                let hint = if self.download_running {
+                                    ""
+                                } else if selected_count == 0 {
+                                    "Bitte mindestens ein Album oder einen Jahresordner auswählen."
+                                } else if target_missing {
+                                    "Bitte einen Zielordner auswählen."
+                                } else {
+                                    "Bereit zum Herunterladen."
+                                };
+                                let color = if can_download {
+                                    egui::Color32::from_rgb(22, 101, 52)
+                                } else {
+                                    egui::Color32::from_rgb(180, 83, 9)
+                                };
+                                ui.add_sized(
+                                    [ui.available_width(), 36.0],
+                                    egui::Label::new(egui::RichText::new(hint).size(12.5).color(color)).wrap(),
+                                );
+                            },
+                        );
+
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        ui.heading(egui::RichText::new("Fortschritt").size(20.0).strong());
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::ProgressBar::new(self.progress)
+                                .show_percentage()
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.add_space(12.0);
+
+                        ui.label(egui::RichText::new("Status").strong());
+                        ui.add_sized(
+                            [ui.available_width(), 56.0],
+                            egui::Label::new(egui::RichText::new(&self.status).size(13.0)).wrap(),
+                        );
+                        ui.add_space(8.0);
+
+                        egui::Grid::new("status_summary_grid")
+                            .num_columns(2)
+                            .min_col_width(120.0)
+                            .spacing([16.0, 8.0])
+                            .show(ui, |ui| {
+                                for (label, value) in [
+                                    ("Ausgewählte Alben", self.selected_album_count().to_string()),
+                                    ("Ausgewählte Jahre", (self.selected_year_count() + self.selected_all_year_count()).to_string()),
+                                    ("Dateien", format!("{} / {}", self.download_current, self.download_total)),
+                                    ("Heruntergeladen", self.download_downloaded.to_string()),
+                                    ("Vorhanden", self.download_skipped.to_string()),
+                                    ("Fehler", self.download_failed.to_string()),
+                                    ("Aktive Downloads", self.download_active.to_string()),
+                                ] {
+                                    ui.label(label);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(value);
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+}
+
+fn ui_tabs(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(egui::Color32::WHITE)
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (tab, label) in [
+                        (ActiveTab::Albums, "Alben"),
+                        (ActiveTab::NoAlbum, "Fotos ohne Album nach Jahr"),
+                        (ActiveTab::AllByYear, "Alle Fotos nach Jahr"),
+                    ] {
+                        let active = self.active_tab == tab;
+                        let button = egui::Button::new(
+                            egui::RichText::new(label)
+                                .strong()
+                                .color(if active { egui::Color32::WHITE } else { egui::Color32::from_rgb(55, 65, 81) })
+                        )
+                        .fill(if active { egui::Color32::from_rgb(20, 105, 235) } else { egui::Color32::from_rgb(246, 247, 249) })
+                        .stroke(egui::Stroke::new(1.0_f32, if active { egui::Color32::from_rgb(20, 105, 235) } else { egui::Color32::from_rgb(218, 222, 228) }))
+                        .rounding(egui::Rounding::same(7.0));
+                        if ui.add(button).clicked() { self.active_tab = tab; }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                match self.active_tab {
+                    ActiveTab::Albums => self.ui_albums_tab(ui),
+                    ActiveTab::NoAlbum => self.ui_no_album_tab(ui),
+                    ActiveTab::AllByYear => self.ui_all_by_year_tab(ui),
+                }
+            });
+    }
+
+    fn fixed_card_columns(width: f32) -> usize {
+        if width >= 1080.0 { 3 } else if width >= 680.0 { 2 } else { 1 }
+    }
+
+    fn truncate_album_title(value: &str, max_per_line: usize, max_lines: usize) -> String {
+        let words: Vec<&str> = value.split_whitespace().collect();
+        if words.is_empty() || max_lines == 0 {
+            return String::new();
+        }
+
+        let mut lines: Vec<String> = vec![String::new()];
+        let mut truncated = false;
+
+        for word in words {
+            let current = lines.last_mut().expect("Mindestens eine Titelzeile");
+            let needed = if current.is_empty() {
+                word.chars().count()
+            } else {
+                current.chars().count() + 1 + word.chars().count()
+            };
+
+            if needed <= max_per_line {
+                if !current.is_empty() { current.push(' '); }
+                current.push_str(word);
+            } else if lines.len() < max_lines {
+                let mut next = String::new();
+                if word.chars().count() <= max_per_line {
+                    next.push_str(word);
+                } else {
+                    next.extend(word.chars().take(max_per_line.saturating_sub(3)));
+                    next.push_str("...");
+                    truncated = true;
+                }
+                lines.push(next);
+                if truncated { break; }
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+
+        if truncated {
+            if let Some(last) = lines.last_mut() {
+                while last.chars().count() > max_per_line.saturating_sub(3) {
+                    last.pop();
+                }
+                if !last.ends_with("...") { last.push_str("..."); }
+            }
+        }
+
+        lines.join("\n")
+    }
+
+
+fn ui_albums_tab(&mut self, ui: &mut egui::Ui) {
+    let selected_count = self.selected_album_count();
+    ui.horizontal_wrapped(|ui| {
+        let search_width = (ui.available_width() * 0.42).clamp(260.0_f32, 430.0_f32);
+        ui.add_sized(
+            [search_width, 36.0_f32],
+            egui::TextEdit::singleline(&mut self.album_search).hint_text("Album suchen ..."),
+        );
+        if ui.add_sized([118.0_f32, 36.0_f32], egui::Button::new("Alle auswählen")).clicked() {
+            for item in &mut self.albums { item.selected = true; }
+        }
+        if ui.add_sized([138.0_f32, 36.0_f32], egui::Button::new("Auswahl aufheben")).clicked() {
+            for item in &mut self.albums { item.selected = false; }
+        }
+
+        let counter_fill = if selected_count > 0 {
+            egui::Color32::from_rgb(219, 234, 254)
+        } else {
+            egui::Color32::from_rgb(243, 244, 246)
+        };
+        let counter_text = if selected_count > 0 {
+            egui::Color32::from_rgb(30, 64, 175)
+        } else {
+            egui::Color32::from_rgb(75, 85, 99)
+        };
+        egui::Frame::none()
+            .fill(counter_fill)
+            .rounding(egui::Rounding::same(9.0_f32))
+            .inner_margin(egui::Margin::symmetric(12.0_f32, 7.0_f32))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} ausgewählt", selected_count))
+                        .strong()
+                        .color(counter_text),
+                );
+            });
+    });
+    ui.add_space(12.0_f32);
+
+    let filter = self.album_search.to_lowercase();
+    let visible: Vec<usize> = self.albums.iter().enumerate()
+        .filter(|(_, item)| filter.is_empty() || item.album.album_name.to_lowercase().contains(&filter))
+        .map(|(i, _)| i).collect();
+
+    let available = (ui.available_width() - 10.0_f32).max(320.0_f32);
+    let gap: f32 = 14.0_f32;
+    let columns: usize = if available >= 1000.0_f32 { 3 } else if available >= 660.0_f32 { 2 } else { 1 };
+    let card_width = ((available - gap * (columns.saturating_sub(1) as f32)) / columns as f32)
+        .clamp(300.0_f32, 390.0_f32);
+    let card_height: f32 = 176.0_f32;
+
+    egui::ScrollArea::vertical()
+        .id_salt("album_preview_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for row in visible.chunks(columns) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for &index in row {
+                        let item = &mut self.albums[index];
+                        let full_name = item.album.album_name.clone();
+                        let display_name = Self::truncate_album_title(&full_name, 27, 5);
+                        let was_truncated = display_name.replace('\n', " ") != full_name;
+                        let fill = if item.selected {
+                            egui::Color32::from_rgb(239, 246, 255)
+                        } else {
+                            egui::Color32::WHITE
+                        };
+                        let stroke = if item.selected {
+                            egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(59, 130, 246))
+                        } else {
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 219, 226))
+                        };
+
+                        let (rect, mut response) = ui.allocate_exact_size(
+                            egui::vec2(card_width, card_height),
+                            egui::Sense::click(),
+                        );
+                        ui.painter().rect_filled(rect, 10.0_f32, fill);
+                        ui.painter().rect_stroke(rect, 10.0_f32, stroke);
+
+                        let mut checkbox_clicked = false;
+                        ui.allocate_ui_at_rect(rect.shrink(12.0_f32), |ui| {
+                            ui.horizontal_top(|ui| {
+                                let checkbox = ui.add_sized(
+                                    [30.0_f32, 30.0_f32],
+                                    egui::Checkbox::new(&mut item.selected, ""),
+                                );
+                                checkbox_clicked = checkbox.clicked();
+                                checkbox.on_hover_text("Album auswählen");
+
+                                let thumb_size = egui::vec2(96.0_f32, 96.0_f32);
+                                if let Some(texture) = &item.thumbnail {
+                                    ui.add(egui::Image::new(texture).fit_to_exact_size(thumb_size));
+                                } else {
+                                    let (thumb_rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                                    ui.painter().rect_filled(thumb_rect, 8.0_f32, egui::Color32::from_rgb(232, 236, 242));
+                                    ui.painter().text(
+                                        thumb_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "Vorschau",
+                                        egui::FontId::proportional(11.0_f32),
+                                        egui::Color32::from_rgb(115, 122, 132),
+                                    );
+                                }
+
+                                ui.add_space(10.0_f32);
+                                ui.vertical(|ui| {
+                                    let content_width = (card_width - 172.0_f32).max(130.0_f32);
+                                    ui.set_width(content_width);
+                                    ui.set_max_width(content_width);
+
+                                    let title_response = ui.add_sized(
+                                        [content_width, 104.0_f32],
+                                        egui::Label::new(
+                                            egui::RichText::new(display_name.clone())
+                                                .strong()
+                                                .size(13.2_f32),
+                                        )
+                                        .wrap(),
+                                    );
+                                    if was_truncated {
+                                        title_response.on_hover_text(full_name.clone());
+                                    }
+
+                                });
+                            });
+                        });
+
+                        let meta_y = rect.bottom() - 20.0_f32;
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 16.0_f32, meta_y),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{} Dateien", item.album.asset_count),
+                            egui::FontId::proportional(12.0_f32),
+                            egui::Color32::from_rgb(75, 85, 99),
+                        );
+
+                        let badge_label = if item.album.shared { "geteilt" } else { "eigen" };
+                        let badge_fill = if item.album.shared {
+                            egui::Color32::from_rgb(219, 234, 254)
+                        } else {
+                            egui::Color32::from_rgb(220, 252, 231)
+                        };
+                        let badge_text = if item.album.shared {
+                            egui::Color32::from_rgb(30, 64, 175)
+                        } else {
+                            egui::Color32::from_rgb(22, 101, 52)
+                        };
+                        let badge_width = if item.album.shared { 58.0_f32 } else { 48.0_f32 };
+                        let badge_rect = egui::Rect::from_center_size(
+                            egui::pos2(rect.right() - 14.0_f32 - badge_width / 2.0_f32, meta_y),
+                            egui::vec2(badge_width, 22.0_f32),
+                        );
+                        ui.painter().rect_filled(badge_rect, 9.0_f32, badge_fill);
+                        ui.painter().text(
+                            badge_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            badge_label,
+                            egui::FontId::proportional(11.0_f32),
+                            badge_text,
+                        );
+                        if response.clicked() && !checkbox_clicked {
+                            item.selected = !item.selected;
+                        }
+                        response = if item.selected {
+                            response.on_hover_text("Ausgewählt – klicken zum Abwählen")
+                        } else {
+                            response.on_hover_text("Klicken, um das gesamte Album auszuwählen")
+                        };
+                        let _ = response;
+                    }
+                });
+                ui.add_space(14.0_f32);
+            }
+        });
+}
+
+fn ui_no_album_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Fotos ohne Album nach Jahr laden").clicked() {
+                if let Err(e) = self.load_no_album_years() { self.status = format!("Fehler: {}", e); }
+            }
+            ui.add_sized([150.0_f32, 30.0_f32], egui::TextEdit::singleline(&mut self.year_search).hint_text("Jahr suchen"));
+            if ui.button("Alle auswählen").clicked() { for item in &mut self.year_buckets { item.selected = true; } }
+            if ui.button("Auswahl aufheben").clicked() { for item in &mut self.year_buckets { item.selected = false; } }
+            ui.label(format!("{} Jahresordner ausgewählt", self.selected_year_count()));
+        });
+        ui.add_space(10.0_f32);
+
+        let filter = self.year_search.to_lowercase();
+        let visible: Vec<usize> = self.year_buckets.iter().enumerate()
+            .filter(|(_, item)| filter.is_empty() || item.year.to_lowercase().contains(&filter))
+            .map(|(i, _)| i).collect();
+
+        let available = (ui.available_width() - 10.0_f32).max(320.0_f32);
+        let gap: f32 = 14.0_f32;
+        let columns: usize = if available >= 1000.0_f32 { 3 } else if available >= 660.0_f32 { 2 } else { 1 };
+        let card_width = ((available - gap * (columns.saturating_sub(1) as f32)) / columns as f32)
+            .clamp(300.0_f32, 390.0_f32);
+        let card_height: f32 = 92.0_f32;
+
+        egui::ScrollArea::vertical().id_salt("no_album_year_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            for row in visible.chunks(columns) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for &index in row {
+                        let item = &mut self.year_buckets[index];
+                        let fill = if item.selected { egui::Color32::from_rgb(239, 246, 255) } else { egui::Color32::WHITE };
+                        let stroke = if item.selected {
+                            egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(59, 130, 246))
+                        } else {
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 219, 226))
+                        };
+                        let (rect, response) = ui.allocate_exact_size(egui::vec2(card_width, card_height), egui::Sense::click());
+                        ui.painter().rect_filled(rect, 10.0_f32, fill);
+                        ui.painter().rect_stroke(rect, 10.0_f32, stroke);
+                        let inner = rect.shrink(12.0_f32);
+                        let mut child = ui.child_ui(inner, egui::Layout::left_to_right(egui::Align::Center), None);
+                        let checkbox = child
+                            .add_sized(
+                                [30.0_f32, 30.0_f32],
+                                egui::Checkbox::new(&mut item.selected, ""),
+                            )
+                            .on_hover_text("Jahresordner auswählen");
+                        child.add_space(8.0_f32);
+                        child.vertical(|ui| {
+                            ui.label(egui::RichText::new(&item.year).strong().size(16.0_f32));
+                            ui.label(egui::RichText::new(format!("{} Dateien · {}", item.count, Self::format_bytes_i64(item.total_size))).size(12.0_f32).color(egui::Color32::from_rgb(75, 85, 99)));
+                        });
+                        if response.clicked() && !checkbox.clicked() { item.selected = !item.selected; }
+                    }
+                });
+                ui.add_space(14.0_f32);
+            }
+        });
+    }
+
+    fn ui_all_by_year_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Alle Fotos nach Jahr laden").clicked() {
+                if let Err(e) = self.load_all_assets_by_year() { self.status = format!("Fehler: {}", e); }
+            }
+            ui.add_sized([150.0_f32, 30.0_f32], egui::TextEdit::singleline(&mut self.year_search).hint_text("Jahr suchen"));
+            if ui.button("Alle auswählen").clicked() { for item in &mut self.all_year_buckets { item.selected = true; } }
+            if ui.button("Auswahl aufheben").clicked() { for item in &mut self.all_year_buckets { item.selected = false; } }
+            ui.label(format!("{} Jahresordner ausgewählt", self.selected_all_year_count()));
+        });
+        ui.add_space(10.0_f32);
+
+        let filter = self.year_search.to_lowercase();
+        let visible: Vec<usize> = self.all_year_buckets.iter().enumerate()
+            .filter(|(_, item)| filter.is_empty() || item.year.to_lowercase().contains(&filter))
+            .map(|(i, _)| i).collect();
+
+        let available = (ui.available_width() - 10.0_f32).max(320.0_f32);
+        let gap: f32 = 14.0_f32;
+        let columns: usize = if available >= 1000.0_f32 { 3 } else if available >= 660.0_f32 { 2 } else { 1 };
+        let card_width = ((available - gap * (columns.saturating_sub(1) as f32)) / columns as f32)
+            .clamp(300.0_f32, 390.0_f32);
+        let card_height: f32 = 92.0_f32;
+
+        egui::ScrollArea::vertical().id_salt("all_year_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            for row in visible.chunks(columns) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for &index in row {
+                        let item = &mut self.all_year_buckets[index];
+                        let fill = if item.selected { egui::Color32::from_rgb(239, 246, 255) } else { egui::Color32::WHITE };
+                        let stroke = if item.selected {
+                            egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(59, 130, 246))
+                        } else {
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 219, 226))
+                        };
+                        let (rect, response) = ui.allocate_exact_size(egui::vec2(card_width, card_height), egui::Sense::click());
+                        ui.painter().rect_filled(rect, 10.0_f32, fill);
+                        ui.painter().rect_stroke(rect, 10.0_f32, stroke);
+                        let inner = rect.shrink(12.0_f32);
+                        let mut child = ui.child_ui(inner, egui::Layout::left_to_right(egui::Align::Center), None);
+                        let checkbox = child
+                            .add_sized(
+                                [30.0_f32, 30.0_f32],
+                                egui::Checkbox::new(&mut item.selected, ""),
+                            )
+                            .on_hover_text("Jahresordner auswählen");
+                        child.add_space(8.0_f32);
+                        child.vertical(|ui| {
+                            ui.label(egui::RichText::new(&item.year).strong().size(16.0_f32));
+                            ui.label(egui::RichText::new(format!("{} Dateien · {}", item.count, Self::format_bytes_i64(item.total_size))).size(12.0_f32).color(egui::Color32::from_rgb(75, 85, 99)));
+                        });
+                        if response.clicked() && !checkbox.clicked() { item.selected = !item.selected; }
+                    }
+                });
+                ui.add_space(14.0_f32);
+            }
+        });
+    }
+
+fn ui_footer(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let ready = !self.download_running && !self.status.to_lowercase().starts_with("fehler");
+            let dot_color = if self.download_running {
+                egui::Color32::from_rgb(245, 158, 11)
+            } else if ready {
+                egui::Color32::from_rgb(34, 197, 94)
+            } else {
+                egui::Color32::from_rgb(239, 68, 68)
+            };
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 5.0, dot_color);
+            ui.label(if self.download_running { "Download läuft" } else if ready { "Bereit" } else { "Fehler" });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            });
+        });
+    }
+
+    fn show_info_popup(&mut self, ctx: &egui::Context) {
+        if !self.info_popup {
+            return;
+        }
+
+        let year = Local::now().year();
+        let mut open = self.info_popup;
+        let mut close_clicked = false;
+
+        egui::Window::new("Info")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(820.0)
+            .default_height(650.0)
+            .min_width(620.0)
+            .min_height(420.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.heading("Immich Backup Manager");
+                ui.label(format!("Freeware · Copyright © {} Ralf Ebert", year));
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("info_program_explanation_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - 52.0_f32).max(260.0_f32))
+                    .show(ui, |ui| {
+                        ui.heading(egui::RichText::new("Programmerklärung").size(20.0));
+                        ui.add_space(4.0);
+                        ui.label("Der Immich Backup Manager ist ein unabhängiges Windows-Programm zum Herunterladen und Sichern von Fotos und Videos aus einer bestehenden Immich-Installation.");
+                        ui.add_space(6.0);
+                        ui.label("Das Programm verbindet sich über die eingegebene Immich-Serveradresse und einen persönlichen API-Key direkt mit dem Immich-Server. Die Zugangsdaten werden ausschließlich für die Verbindung mit dem angegebenen Server verwendet.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Unterstützte Sicherungsarten").strong());
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Alben").strong());
+                        ui.label("Ausgewählte Immich-Alben werden vollständig heruntergeladen. Für jedes Album wird im Zielordner ein eigener Ordner mit dem jeweiligen Albumnamen erstellt.");
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("Fotos ohne Album nach Jahr").strong());
+                        ui.label("Fotos und Videos, die keinem Album zugeordnet sind, werden nach ihrem Aufnahmejahr sortiert und in entsprechenden Jahresordnern gespeichert.");
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("Alle Fotos nach Jahr").strong());
+                        ui.label("Alle in Immich vorhandenen Fotos und Videos werden unabhängig von ihrer Albumzuordnung nach Aufnahmejahr sortiert heruntergeladen.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Albumübersicht").strong());
+                        ui.label("Die vorhandenen Alben werden mit Albumname, Vorschaubild, Dateianzahl sowie der Kennzeichnung „eigen“ oder „geteilt“ angezeigt. Mehrere Alben oder Jahresordner können gleichzeitig ausgewählt werden.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Vorhandene Dateien").strong());
+                        ui.label(egui::RichText::new("Vergleichen / nachfragen").strong());
+                        ui.label("Bereits vorhandene Dateien werden nicht sofort überschrieben. Unterscheiden sich die vorhandene und die in Immich gespeicherte Datei, öffnet sich ein Vergleichsfenster.");
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("Direkt überschreiben").strong());
+                        ui.label("Vorhandene Dateien werden ohne weitere Nachfrage durch die Version aus Immich ersetzt. Gleich große und bereits vollständig vorhandene Dateien können automatisch übersprungen werden.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Duplikat- und Dateivergleich").strong());
+                        ui.label("Unterschiedliche Versionen einer bereits vorhandenen Datei können gegenübergestellt werden. Das Programm zeigt, soweit verfügbar, Bildvorschau, Dateiname, Aufnahmezeit, Dateigröße, Auflösung und Speicherort an. Die endgültige Entscheidung, welche Datei erhalten bleibt, trifft der Benutzer.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Parallele Downloads").strong());
+                        ui.label("Zur Beschleunigung der Sicherung können mehrere Dateien gleichzeitig heruntergeladen werden. Die Anzahl der parallelen Downloads lässt sich in den Einstellungen auswählen.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Fortschrittsanzeige").strong());
+                        ui.label("Während des Downloads werden Status, ausgewählte Alben oder Jahre, Dateianzahl, heruntergeladene und vorhandene Dateien, Fehler sowie aktuell laufende Downloads angezeigt.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Speicherung des API-Keys").strong());
+                        ui.label("Der zuletzt verwendete API-Key kann ausschließlich lokal im Windows-Benutzerprofil gespeichert werden. Über die Schaltfläche „Gespeicherten API-Key löschen“ kann er jederzeit entfernt werden. Der API-Key wird nicht an den Entwickler oder an fremde Server übertragen.");
+
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Hinweis zu Backups").strong());
+                        ui.label("Nach jeder größeren Sicherung sollte überprüft werden, ob die erwarteten Dateien vollständig im Zielordner vorhanden und lesbar sind. Das Programm ersetzt kein zusätzliches, regelmäßig geprüftes Backup-Konzept.");
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.label(egui::RichText::new("Freeware / Rechte").strong());
+                        ui.label("Dieses Programm ist Freeware und darf kostenlos genutzt werden. Es ist ein unabhängiges Werkzeug und steht in keiner Verbindung zum offiziellen Immich-Projekt.");
+                        ui.add_space(5.0);
+                        ui.label("Alle Rechte am Programm, am Design und am Quellcode verbleiben bei Ralf Ebert. Der veröffentlichte Quellcode dient der Transparenz und der Nachvollziehbarkeit.");
+                        ui.add_space(5.0);
+                        ui.label("Ohne vorherige schriftliche Genehmigung sind insbesondere nicht erlaubt: Verkauf, Umbenennung, Veröffentlichung geänderter Versionen, Weitergabe geänderter Quelltexte, Nutzung unter fremdem Namen oder die kommerzielle Verwertung des Programms oder von Teilen davon.");
+                        ui.add_space(5.0);
+                        ui.label("Die Nutzung erfolgt auf eigene Gefahr. Für Datenverlust, unvollständige Sicherungen, Fehlbedienung oder daraus entstehende Schäden wird keine Haftung übernommen.");
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(format!("Copyright © {} Ralf Ebert", year)).strong());
+                        ui.add_space(8.0);
+                    });
+
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Schließen").clicked() {
+                        close_clicked = true;
+                    }
+                });
+            });
+
+        self.info_popup = open && !close_clicked;
+    }
+
+fn show_download_popup(&mut self, ctx: &egui::Context) {
+        if !self.download_popup { return; }
+        let mut open = self.download_popup;
+        let mut close_clicked = false;
+        let mut cancel_clicked = false;
+
+        egui::Window::new("Download")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.download_album_total > 0 && self.download_album_current > 0 {
+                    ui.label(egui::RichText::new(format!(
+                        "Album {} von {}: {}",
+                        self.download_album_current, self.download_album_total, self.download_album_name
+                    )).strong());
+                    ui.add_space(4.0);
+                }
+
+                if self.download_total > 0 {
+                    ui.heading(format!("Datei {} von {}", self.download_current.min(self.download_total), self.download_total));
+                } else {
+                    ui.heading("Download wird vorbereitet ...");
+                }
+
+                ui.add_space(8.0);
+                let frac = if self.download_total > 0 { self.download_current as f32 / self.download_total as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(frac).show_percentage().desired_width(ui.available_width()));
+                ui.add_space(8.0);
+                ui.label(&self.download_file);
+                ui.label(format!("Aktive Downloads: {}", self.download_active));
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Heruntergeladen: {}", self.download_downloaded));
+                    ui.label(format!("Vorhanden: {}", self.download_skipped));
+                    ui.label(format!("Fehler: {}", self.download_failed));
+                });
+
+                ui.add_space(10.0);
+                if self.download_running {
+                    if ui.button("Download abbrechen").clicked() { cancel_clicked = true; }
+                } else if ui.button("Schließen").clicked() {
+                    close_clicked = true;
+                }
+            });
+
+        if cancel_clicked {
+            if let Some(flag) = &self.download_cancel {
+                flag.store(true, Ordering::Relaxed);
+                self.status = "Abbruch angefordert – laufende Dateien werden noch beendet ...".to_string();
+                self.download_file = "Download wird abgebrochen ...".to_string();
+            }
+        }
+        self.download_popup = open && !close_clicked;
+    }
+
+    fn conflict_target_path(&self, item: &ConflictItem) -> PathBuf {
+        Path::new(&self.target_dir)
+            .join(&item.job.folder_name)
+            .join(Self::sanitize_file_name(&Self::asset_file_name(&item.job.asset)))
+    }
+
+    fn texture_and_size_from_bytes(
+        ctx: &egui::Context,
+        id: &str,
+        bytes: &[u8],
+    ) -> Option<(egui::TextureHandle, (u32, u32))> {
+        let decoded = image::load_from_memory(bytes).ok()?;
+        let rgba = decoded.to_rgba8();
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let dims = (decoded.width(), decoded.height());
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        let texture = ctx.load_texture(id.to_string(), color_image, egui::TextureOptions::LINEAR);
+        Some((texture, dims))
+    }
+
+    fn ensure_current_conflict_preview(&mut self, ctx: &egui::Context) {
+        let Some(item) = self.conflicts.get(self.conflict_index).cloned() else { return; };
+        let preview_key = format!("{}:{}", item.job.asset.id, self.conflict_index);
+        if self.conflict_preview_key == preview_key {
+            return;
+        }
+
+        self.conflict_preview_key = preview_key;
+        self.conflict_local_texture = None;
+        self.conflict_remote_texture = None;
+        self.conflict_local_dims = None;
+        self.conflict_remote_dims = None;
+
+        let local_path = self.conflict_target_path(&item);
+        if let Ok(bytes) = fs::read(&local_path) {
+            if let Some((texture, dims)) = Self::texture_and_size_from_bytes(ctx, &format!("conf_local_{}", item.job.asset.id), &bytes) {
+                self.conflict_local_texture = Some(texture);
+                self.conflict_local_dims = Some(dims);
+            }
+        }
+
+        if let (Ok(base), Ok(key), Ok(client)) = (self.base_url(), self.ensure_api_key(), self.client()) {
+            let url = format!("{}/api/assets/{}/thumbnail?size=thumbnail", base, item.job.asset.id);
+            if let Ok(resp) = client
+                .get(url)
+                .header("x-api-key", key)
+                .send()
+                .and_then(|r| r.error_for_status()) {
+                if let Ok(bytes) = resp.bytes() {
+                    if let Some((texture, dims)) = Self::texture_and_size_from_bytes(ctx, &format!("conf_remote_{}", item.job.asset.id), bytes.as_ref()) {
+                        self.conflict_remote_texture = Some(texture);
+                        self.conflict_remote_dims = Some(dims);
+                    }
+                }
+            }
+        }
+    }
+
+    fn show_zoom_window(&mut self, ctx: &egui::Context) {
+        if !self.conflict_zoom_open { return; }
+        let mut open = self.conflict_zoom_open;
+        egui::Window::new(self.conflict_zoom_title.clone())
+            .open(&mut open)
+            .default_width(900.0)
+            .default_height(700.0)
+            .show(ctx, |ui| {
+                if let Some(texture) = &self.conflict_zoom_texture {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        let size = texture.size_vec2();
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                    });
+                } else {
+                    ui.label("Keine Vorschau verfügbar.");
+                }
+            });
+        self.conflict_zoom_open = open;
+    }
+
+    fn show_conflict_popup(&mut self, ctx: &egui::Context) {
+        if !self.conflict_popup || self.conflicts.is_empty() {
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::N)) {
+            if self.conflict_index + 1 < self.conflicts.len() {
+                self.conflict_index += 1;
+                self.conflict_preview_key.clear();
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+            if self.conflict_index > 0 {
+                self.conflict_index -= 1;
+                self.conflict_preview_key.clear();
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            if let Some(item) = self.conflicts.get_mut(self.conflict_index) {
+                item.selected = !item.selected;
+            }
+        }
+
+        self.ensure_current_conflict_preview(ctx);
+
+        let total_groups = self.conflicts.len();
+        let current_index = self.conflict_index.min(total_groups.saturating_sub(1));
+        let item = self.conflicts[current_index].clone();
+        let local_path = self.conflict_target_path(&item);
+        let local_keep = !item.selected;
+        let remote_keep = item.selected;
+        let mut open = self.conflict_popup;
+        let mut close_clicked = false;
+        let mut overwrite_selected = false;
+        let mut overwrite_all = false;
+        let mut keep_larger = false;
+
+        egui::Window::new("Duplikate / vorhandene Dateien")
+            .collapsible(false)
+            .default_width(1260.0)
+            .default_height(820.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading(format!("Gruppe {} von {}", current_index + 1, total_groups));
+                    ui.separator();
+                    ui.label(format!("Datei: {}", Self::asset_file_name(&item.job.asset)));
+                });
+                ui.label("Pfeiltasten links/rechts oder N = nächste Gruppe, Leertaste = Auswahl umschalten");
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("← Vorherige Gruppe").clicked() && self.conflict_index > 0 {
+                        self.conflict_index -= 1;
+                        self.conflict_preview_key.clear();
+                    }
+                    if ui.button("Nächste Gruppe →").clicked() && self.conflict_index + 1 < total_groups {
+                        self.conflict_index += 1;
+                        self.conflict_preview_key.clear();
+                    }
+                    if ui.button("Nur diese: größere Immich-Datei behalten").clicked() {
+                        if let Some(cur) = self.conflicts.get_mut(current_index) {
+                            cur.selected = cur.remote_size.map(|size| size > cur.local_size).unwrap_or(false);
+                        }
+                    }
+                    if ui.button("Alle: größere Immich-Dateien markieren").clicked() {
+                        for c in &mut self.conflicts {
+                            c.selected = c.remote_size.map(|size| size > c.local_size).unwrap_or(false);
+                        }
+                    }
+                });
+                ui.separator();
+
+                ui.columns(2, |cols| {
+                    let left_fill = if local_keep { egui::Color32::from_rgb(235, 250, 239) } else { egui::Color32::from_rgb(255, 243, 243) };
+                    let right_fill = if remote_keep { egui::Color32::from_rgb(235, 250, 239) } else { egui::Color32::from_rgb(255, 243, 243) };
+                    let left_label = if local_keep { "Wird behalten" } else { "Nicht ausgewählt" };
+                    let right_label = if remote_keep { "Wird behalten" } else { "Nicht ausgewählt" };
+
+                    egui::Frame::group(cols[0].style())
+                        .fill(left_fill)
+                        .show(&mut cols[0], |ui| {
+                            ui.heading("Vorhandene Datei im Zielordner");
+                            ui.colored_label(if local_keep { egui::Color32::from_rgb(22, 163, 74) } else { egui::Color32::from_rgb(220, 38, 38) }, left_label);
+                            ui.add_space(6.0);
+                            if let Some(texture) = &self.conflict_local_texture {
+                                let img_size = egui::vec2(320.0, 320.0);
+                                let resp = ui.add(egui::Image::new(texture).fit_to_exact_size(img_size).sense(egui::Sense::click()));
+                                if resp.clicked() {
+                                    self.conflict_zoom_texture = Some(texture.clone());
+                                    self.conflict_zoom_title = "Großansicht – vorhandene Datei".to_string();
+                                    self.conflict_zoom_open = true;
+                                }
+                            } else {
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(320.0, 320.0), egui::Sense::hover());
+                                ui.painter().rect_filled(r, 8.0, egui::Color32::from_rgb(232, 236, 242));
+                                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "Keine Vorschau", egui::FontId::proportional(16.0), egui::Color32::from_rgb(110,110,110));
+                            }
+                            ui.add_space(8.0);
+                            ui.label(format!("Dateiname: {}", Self::asset_file_name(&item.job.asset)));
+                            ui.label(format!("Aufnahmezeit: {}", if item.job.asset.local_date_time.trim().is_empty() { "unbekannt" } else { &item.job.asset.local_date_time }));
+                            ui.label(format!("Dateigröße: {}", Self::format_bytes_u64(item.local_size)));
+                            ui.label(format!("Auflösung: {}", self.conflict_local_dims.map(|(w,h)| format!("{} × {} px", w, h)).unwrap_or_else(|| "unbekannt".to_string())));
+                            ui.label(format!("Pfad: {}", local_path.display()));
+                            ui.add_space(10.0);
+                            if ui.button("Diese lokale Datei behalten").clicked() {
+                                if let Some(cur) = self.conflicts.get_mut(current_index) { cur.selected = false; }
+                            }
+                        });
+
+                    egui::Frame::group(cols[1].style())
+                        .fill(right_fill)
+                        .show(&mut cols[1], |ui| {
+                            ui.heading("Immich-Datei");
+                            ui.colored_label(if remote_keep { egui::Color32::from_rgb(22, 163, 74) } else { egui::Color32::from_rgb(220, 38, 38) }, right_label);
+                            ui.add_space(6.0);
+                            if let Some(texture) = &self.conflict_remote_texture {
+                                let img_size = egui::vec2(320.0, 320.0);
+                                let resp = ui.add(egui::Image::new(texture).fit_to_exact_size(img_size).sense(egui::Sense::click()));
+                                if resp.clicked() {
+                                    self.conflict_zoom_texture = Some(texture.clone());
+                                    self.conflict_zoom_title = "Großansicht – Immich-Datei".to_string();
+                                    self.conflict_zoom_open = true;
+                                }
+                            } else {
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(320.0, 320.0), egui::Sense::hover());
+                                ui.painter().rect_filled(r, 8.0, egui::Color32::from_rgb(232, 236, 242));
+                                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "Keine Vorschau", egui::FontId::proportional(16.0), egui::Color32::from_rgb(110,110,110));
+                            }
+                            ui.add_space(8.0);
+                            ui.label(format!("Dateiname: {}", Self::asset_file_name(&item.job.asset)));
+                            ui.label(format!("Aufnahmezeit: {}", if item.job.asset.local_date_time.trim().is_empty() { "unbekannt" } else { &item.job.asset.local_date_time }));
+                            ui.label(format!("Dateigröße: {}", item.remote_size.map(Self::format_bytes_u64).unwrap_or_else(|| "nicht ermittelbar".to_string())));
+                            ui.label(format!("Auflösung: {}", self.conflict_remote_dims.map(|(w,h)| format!("{} × {} px", w, h)).unwrap_or_else(|| "unbekannt".to_string())));
+                            ui.label(format!("Zielordner: {}", item.job.folder_name));
+                            ui.add_space(10.0);
+                            if ui.button("Diese Immich-Datei behalten / überschreiben").clicked() {
+                                if let Some(cur) = self.conflicts.get_mut(current_index) { cur.selected = true; }
+                            }
+                        });
+                });
+
+                ui.add_space(10.0);
+                let selected_count = self.conflicts.iter().filter(|c| c.selected).count();
+                ui.label(format!("Für Überschreiben markiert: {} von {}", selected_count, total_groups));
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Ausgewählte überschreiben").clicked() { overwrite_selected = true; }
+                    if ui.button("Alle überschreiben").clicked() { overwrite_all = true; }
+                    if ui.button("Jeweils größere Datei behalten").clicked() { keep_larger = true; }
+                    if ui.button("Schließen").clicked() { close_clicked = true; }
+                });
+            });
+
+        self.conflict_popup = open && !close_clicked;
+
+        let jobs = if overwrite_all {
+            Some(self.conflicts.iter().map(|x| x.job.clone()).collect::<Vec<_>>())
+        } else if overwrite_selected {
+            Some(self.conflicts.iter().filter(|x| x.selected).map(|x| x.job.clone()).collect::<Vec<_>>())
+        } else if keep_larger {
+            Some(
+                self.conflicts.iter().filter(|x| x.remote_size.map(|size| size > x.local_size).unwrap_or(false))
+                    .map(|x| x.job.clone()).collect::<Vec<_>>()
+            )
+        } else {
+            None
+        };
+
+        if let Some(jobs) = jobs {
+            if jobs.is_empty() {
+                self.status = "Keine sicher ermittelte Immich-Datei ist größer als die vorhandene Datei.".to_string();
+                self.conflict_popup = false;
+            } else if let Err(e) = self.start_conflict_overwrite(jobs) {
+                self.status = format!("Fehler: {}", e);
+            }
+        }
+
+        self.show_zoom_window(ctx);
+    }
+
+}
+
+impl eframe::App for ImmichApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        Self::apply_style(ctx);
+        self.poll_download_events();
+        self.poll_thumbnail_events(ctx);
+
+        egui::TopBottomPanel::bottom("footer_panel")
+            .exact_height(34.0)
+            .frame(egui::Frame::none().fill(egui::Color32::WHITE).inner_margin(egui::Margin::symmetric(16.0, 7.0)))
+            .show(ctx, |ui| self.ui_footer(ui));
+
+        egui::TopBottomPanel::top("top_panel")
+            .frame(egui::Frame::none().fill(egui::Color32::WHITE))
+            .show(ctx, |ui| self.ui_header(ui));
+
+        egui::SidePanel::right("download_panel")
+            .resizable(false)
+            .exact_width(430.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(247, 248, 250))
+                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                self.ui_right_panel(ui);
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(247, 248, 250))
+                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                self.ui_tabs(ui);
+            });
+
+        self.show_info_popup(ctx);
+        self.show_download_popup(ctx);
+        self.show_conflict_popup(ctx);
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+fn load_window_icon() -> egui::viewport::IconData {
+    let image = image::load_from_memory(include_bytes!("../app.png"))
+        .expect("Das eingebettete Programmsymbol konnte nicht geladen werden.")
+        .into_rgba8();
+
+    let (width, height) = image.dimensions();
+
+    egui::viewport::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Immich Backup Manager")
+            .with_icon(load_window_icon())
+            .with_inner_size([1450.0, 850.0])
+            .with_min_inner_size([1050.0, 680.0])
+            .with_maximized(false),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Immich Backup Manager",
+        options,
+        Box::new(|cc| {
+            let mut app = ImmichApp::default();
+            let decoded = image::load_from_memory(include_bytes!("../app.png"))
+                .expect("Das eingebettete Programmlogo konnte nicht geladen werden.")
+                .into_rgba8();
+            let size = [decoded.width() as usize, decoded.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+            app.logo_texture = Some(cc.egui_ctx.load_texture(
+                "program_logo",
+                color_image,
+                egui::TextureOptions::LINEAR,
+            ));
+            Ok(Box::new(app))
+        }),
+    )
+}
