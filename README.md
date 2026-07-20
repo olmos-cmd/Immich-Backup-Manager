@@ -1,6 +1,15 @@
 # Immich Backup Manager
 
-![Programmvorschau](docs/programm-vorschau.png)
+## Programmvorschau
+
+### Alben
+![Albenansicht](docs/alben-ansicht.png)
+
+### Fotos ohne Album nach Jahr
+![Jahresordneransicht](docs/jahresordner-ansicht.png)
+
+### Download
+![Download-Fortschritt](docs/download-fortschritt.png)
 
 
 ## Oberfläche / Interface
