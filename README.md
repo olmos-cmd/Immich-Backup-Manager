@@ -1,15 +1,22 @@
 # Immich Backup Manager
 
-**Version 1.3.1 · Windows · English & Deutsch · Freeware**
+<p align="center">
+  <img src="app.png" alt="Immich Backup Manager logo" width="220">
+</p>
 
-The **Immich Backup Manager** downloads original photos and videos from a self-hosted Immich installation. It supports complete albums, photos without albums grouped by year, and all photos grouped by year. Existing files can be skipped, overwritten, or reviewed in a dedicated comparison window.
+<p align="center">
+  <strong>Windows utility for downloading and backing up original photos and videos from Immich.</strong><br>
+  <strong>Windows-Hilfsprogramm zum Herunterladen und Sichern originaler Fotos und Videos aus Immich.</strong>
+</p>
 
-Der **Immich Backup Manager** lädt Originalfotos und Originalvideos aus einer eigenen Immich-Installation herunter. Unterstützt werden vollständige Alben, Fotos ohne Album nach Jahr sowie alle Fotos nach Jahr. Bereits vorhandene Dateien können übersprungen, überschrieben oder in einem eigenen Vergleichsfenster geprüft werden.
+<p align="center">
+  <a href="#english">English</a> · <a href="#deutsch">Deutsch</a> ·
+  <a href="CHANGELOG.md">Changelog</a> · <a href="RELEASE_NOTES.md">Release notes</a> ·
+  <a href="LICENSE">License</a>
+</p>
 
-> This project is an independent utility and is not affiliated with the official Immich project.  
-> Dieses Projekt ist ein unabhängiges Werkzeug und steht in keiner Verbindung zum offiziellen Immich-Projekt.
-
----
+> **Version 1.3.1 · Windows · Freeware · Copyright © 2026 Ralf Ebert · All rights reserved.**  
+> Independent utility — not an official Immich product.
 
 ## Screenshots
 
@@ -39,7 +46,13 @@ Der **Immich Backup Manager** lädt Originalfotos und Originalvideos aus einer e
 
 ---
 
+<a id="english"></a>
+
 # English
+
+## Purpose of the program
+
+The **Immich Backup Manager 1.3.1** downloads original photos and videos from a self-hosted Immich installation. It supports complete albums, photos without albums grouped by year, and all photos grouped by year. Existing files can be skipped, overwritten, or reviewed in a dedicated comparison window.
 
 ## Features
 
@@ -124,17 +137,19 @@ Alternatively:
 cargo build --release
 ```
 
-## GitHub Actions
-
-Every push and pull request checks the project on Windows and creates a release build. The Windows executable is uploaded as a workflow artifact. A tag in the format `v1.3.1` additionally starts the release workflow.
-
 ## Important backup notice
 
 After every major backup, verify that the expected files are present and readable. This application does not replace an additional, regularly tested backup strategy.
 
 ---
 
+<a id="deutsch"></a>
+
 # Deutsch
+
+## Zweck des Programms
+
+Der **Immich Backup Manager 1.3.1** lädt Originalfotos und Originalvideos aus einer eigenen Immich-Installation herunter. Unterstützt werden vollständige Alben, Fotos ohne Album nach Jahr sowie alle Fotos nach Jahr. Bereits vorhandene Dateien können übersprungen, überschrieben oder in einem eigenen Vergleichsfenster geprüft werden.
 
 ## Funktionen
 
@@ -219,10 +234,6 @@ Alternativ:
 cargo build --release
 ```
 
-## GitHub Actions
-
-Bei jedem Push und Pull Request wird das Projekt unter Windows geprüft und als Release-Build kompiliert. Das erzeugte Windows-Programm wird als Workflow-Artefakt bereitgestellt. Ein Tag im Format `v1.3.1` startet zusätzlich den Release-Workflow.
-
 ## Wichtiger Backup-Hinweis
 
 Nach jeder größeren Sicherung sollte geprüft werden, ob die erwarteten Dateien vollständig vorhanden und lesbar sind. Das Programm ersetzt kein zusätzliches, regelmäßig geprüftes Backup-Konzept.
@@ -233,6 +244,11 @@ Nach jeder größeren Sicherung sollte geprüft werden, ob die erwarteten Dateie
 
 See [CHANGELOG.md](CHANGELOG.md).  
 Siehe [CHANGELOG.md](CHANGELOG.md).
+
+## Release notes
+
+See [RELEASE_NOTES.md](RELEASE_NOTES.md).  
+Siehe [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## License / Lizenz
 
