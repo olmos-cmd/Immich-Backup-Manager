@@ -70,7 +70,7 @@
 - Optionally overwrite existing files directly
 - Manage duplicates in a dedicated window
 - Use equal-sized comparison panels and preview areas
-- Correct EXIF orientation for local previews
+- Correctly orient local image previews based on EXIF metadata
 - Use a German or English interface
 - Use dark mode or light mode
 
@@ -155,7 +155,7 @@ Der **Immich Backup Manager 1.3.2** lädt Originalfotos und Originalvideos aus e
 - Wahlweise direktes Überschreiben
 - Duplikatverwaltung in einem eigenen Fenster
 - Gleich große Vergleichsboxen und Vorschaubereiche
-- EXIF-Korrektur für lokale Bildvorschauen
+- Korrekte Ausrichtung lokaler Bildvorschauen anhand der EXIF-Daten
 - Deutsche und englische Benutzeroberfläche
 - Dark Mode und Light Mode
 
